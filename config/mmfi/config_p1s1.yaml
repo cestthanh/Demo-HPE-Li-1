@@ -1,0 +1,35 @@
+# DSK-only ablation: MMFi Protocol 1, Setting 1 (random split).
+# Values intentionally match the HPE-Li++ 3D reference configuration.
+modality: wifi-csi
+protocol: protocol1
+data_unit: frame
+
+random_split:
+  ratio: 0.8
+  random_seed: 0
+  train_dataset:
+    split: training
+    scenes: null
+    subjects: null
+    actions: all
+  val_dataset:
+    split: validation
+    scenes: null
+    subjects: null
+    actions: all
+
+split_to_use: random_split
+init_rand_seed: 0
+
+train_loader:
+  batch_size: 16
+  num_workers: 4
+  pin_memory: true
+val_loader:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+test_loader:
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
