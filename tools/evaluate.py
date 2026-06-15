@@ -55,7 +55,7 @@ def parse_args():
                    help="Root directory of the MMFi dataset.")
     p.add_argument("--config",
                    default=str(PROJECT_ROOT / "config" / "mmfi" /
-                               "config_p1s1.yaml"),
+                               "config_phase_c_demo_2_p1s1.yaml"),
                    help="Fallback YAML config if checkpoint has none.")
     p.add_argument("--split-to-use", default=None,
                    choices=["random_split", "cross_scene_split",
@@ -98,7 +98,7 @@ def load_config(args, checkpoint):
     if isinstance(checkpoint, dict) and "config" in checkpoint:
         config = copy.deepcopy(checkpoint["config"])
     else:
-        with open(args.config) as f:
+        with open(args.config, encoding="utf-8") as f:
             config = yaml.load(f, Loader=yaml.FullLoader)
     if args.split_to_use is not None:
         config["split_to_use"] = args.split_to_use
@@ -281,9 +281,6 @@ def main():
     })
 
     # ── Output paths ─────────────────────────────────────────────────────────
-    def _out(flag, suffix):
-        return Path(flag) if flag else ckpt_path.parent / f"{suffix}_{args.eval_split}.{flag.split('.')[-1] if flag else 'auto'}"
-
     out_json = Path(args.output_json) if args.output_json \
                else ckpt_path.parent / f"metrics_{args.eval_split}.json"
     out_md   = Path(args.output_md)   if args.output_md \
@@ -294,9 +291,12 @@ def main():
     for p in (out_json, out_md, out_gmd):
         p.parent.mkdir(parents=True, exist_ok=True)
 
-    out_json.write_text(json.dumps(metrics, indent=2))
-    out_md.write_text(_per_joint_md(metrics))
-    out_gmd.write_text(_graphpose_md(metrics, args.method_name))
+    out_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    out_md.write_text(_per_joint_md(metrics), encoding="utf-8")
+    out_gmd.write_text(
+        _graphpose_md(metrics, args.method_name),
+        encoding="utf-8",
+    )
 
     # ── Console summary ───────────────────────────────────────────────────────
     m = metrics
@@ -309,11 +309,6 @@ def main():
         f"model_config={model.get_model_config()}",
         flush=True,
     )
-    print(f"[diagnostics] root_mpjpe={m['root_mpjpe_mm']:.3f} "
-          f"rc_mpjpe={m['root_centered_mpjpe_mm']:.3f} "
-          f"const_mpjpe={m['constant_mean_pose_mpjpe_mm']:.3f} "
-          f"pa_gain_over_const={m['pa_mpjpe_gain_over_constant_mean_pose_mm']:.3f}",
-          flush=True)
     print(f"[saved] {out_json}", flush=True)
     print(f"[saved] {out_md}",   flush=True)
     print(f"[saved] {out_gmd}",  flush=True)

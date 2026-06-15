@@ -30,8 +30,6 @@ MMFI_17_JOINT_NAMES = [
     "R.Shoulder", "R.Elbow",  "R.Hand",
 ]
 
-XYZ_AXIS_NAMES = ("x", "y", "z")
-
 # Body-scale joint pair used for g_PCK (corrected MMFi definition)
 MMFI_BODY_SCALE_JOINTS      = (1, 11)          # R.Hip → L.Shoulder
 MMFI_BODY_SCALE_JOINT_NAMES = ("R.Hip", "L.Shoulder")
@@ -151,78 +149,30 @@ def pa_mpjpe_mm(pred_xyz, gt_xyz, return_invalid_count=False):
 # ─── Aggregate metric bundle ──────────────────────────────────────────────────
 
 def compute_3d_metrics(pred_xyz, gt_xyz):
-    """Compute all 3D pose metrics and return them in a single dict.
-
-    Args:
-        pred_xyz: Predicted 3D poses, shape (N, 17, 3).
-        gt_xyz:   Ground-truth 3D poses, shape (N, 17, 3).
-
-    Returns:
-        dict with keys including:
-            mpjpe_mm, pa_mpjpe_mm, pck_50mm, pck_100mm,
-            g_PCK@10 .. g_PCK@50, per_joint_mpjpe_mm,
-            root_mpjpe_mm, root_centered_mpjpe_mm,
-            constant_mean_pose_mpjpe_mm, pa_mpjpe_gain_over_constant_mean_pose_mm,
-            and per-axis / collapse-diagnostic statistics.
-    """
+    """Compute the metrics used by the P1-S1 training/evaluation pipeline."""
     pred, gt = _validate(pred_xyz, gt_xyz)
-
-    per_joint   = per_joint_mpjpe_mm(pred, gt)
-    pa_val, inv = pa_mpjpe_mm(pred, gt, return_invalid_count=True)
-    axis_mae    = np.mean(np.abs(pred - gt), axis=(0, 1)) * 1000.0
-    root_mae    = np.mean(np.abs(pred[:, 0, :] - gt[:, 0, :]), axis=0) * 1000.0
-    root_mpjpe  = np.linalg.norm(pred[:, 0, :] - gt[:, 0, :], axis=-1).mean() * 1000.0
-
-    rc_pred     = pred - pred[:, 0:1, :]
-    rc_gt       = gt   - gt[:, 0:1, :]
-    rc_mpjpe    = np.linalg.norm(rc_pred - rc_gt, axis=-1).mean() * 1000.0
-
-    pred_std    = pred.reshape(-1, 3).std(axis=0) * 1000.0
-    gt_std      = gt.reshape(-1, 3).std(axis=0)   * 1000.0
-    std_ratio   = np.divide(pred_std, gt_std,
-                             out=np.full(3, np.nan),
-                             where=gt_std > 1e-8)
-
-    const_pose  = np.broadcast_to(gt.mean(axis=0, keepdims=True), gt.shape)
-    const_pa, const_pa_inv = pa_mpjpe_mm(const_pose, gt, return_invalid_count=True)
-    const_mpjpe = mpjpe_mm(const_pose, gt)
+    per_joint = per_joint_mpjpe_mm(pred, gt)
+    pa_value, pa_invalid = pa_mpjpe_mm(
+        pred, gt, return_invalid_count=True
+    )
 
     metrics = {
-        # Core metrics
-        "mpjpe_mm":                             mpjpe_mm(pred, gt),
-        "pa_mpjpe_mm":                          pa_val,
-        "pa_mpjpe_invalid_count":               inv,
-        "pck_50mm":                             pck_3d_mm(pred, gt, 50.0),
-        "pck_100mm":                            pck_3d_mm(pred, gt, 100.0),
-        # Per-joint breakdown
-        "per_joint_mpjpe_mm":                   per_joint,
-        "per_joint_mpjpe_mm_by_name":           dict(zip(MMFI_17_JOINT_NAMES, per_joint)),
-        # Collapse diagnostics
-        "axis_mae_mm":                          axis_mae.astype(float).tolist(),
-        "axis_mae_mm_by_name":                  dict(zip(XYZ_AXIS_NAMES, map(float, axis_mae))),
-        "root_mpjpe_mm":                        float(root_mpjpe),
-        "root_axis_mae_mm_by_name":             dict(zip(XYZ_AXIS_NAMES, map(float, root_mae))),
-        "root_centered_mpjpe_mm":               float(rc_mpjpe),
-        "pred_coord_std_mm_by_name":            dict(zip(XYZ_AXIS_NAMES, map(float, pred_std))),
-        "gt_coord_std_mm_by_name":              dict(zip(XYZ_AXIS_NAMES, map(float, gt_std))),
-        "coord_std_ratio_by_name":              dict(zip(XYZ_AXIS_NAMES, map(float, std_ratio))),
-        # Constant-mean-pose baseline
-        "constant_mean_pose_mpjpe_mm":          float(const_mpjpe),
-        "constant_mean_pose_pa_mpjpe_mm":       float(const_pa),
-        "constant_mean_pose_pa_invalid_count":  int(const_pa_inv),
-        "mpjpe_gain_over_constant_mean_pose_mm":    float(const_mpjpe - mpjpe_mm(pred, gt)),
-        "pa_mpjpe_gain_over_constant_mean_pose_mm": float(const_pa - pa_val),
-        "constant_mean_pose_pck_50mm":          pck_3d_mm(const_pose, gt, 50.0),
-        "constant_mean_pose_pck_100mm":         pck_3d_mm(const_pose, gt, 100.0),
-        # g_PCK metadata
-        "g_PCK_scale_joints":                   list(MMFI_BODY_SCALE_JOINTS),
-        "g_PCK_scale_joint_names":              list(MMFI_BODY_SCALE_JOINT_NAMES),
-        "g_PCK_scale_source":                   "ground_truth",
+        "mpjpe_mm":                    mpjpe_mm(pred, gt),
+        "pa_mpjpe_mm":                 pa_value,
+        "pa_mpjpe_invalid_count":      pa_invalid,
+        "pck_50mm":                    pck_3d_mm(pred, gt, 50.0),
+        "pck_100mm":                   pck_3d_mm(pred, gt, 100.0),
+        "per_joint_mpjpe_mm":          per_joint,
+        "per_joint_mpjpe_mm_by_name":  dict(
+            zip(MMFI_17_JOINT_NAMES, per_joint)
+        ),
+        "g_PCK_scale_joints":          list(MMFI_BODY_SCALE_JOINTS),
+        "g_PCK_scale_joint_names":     list(MMFI_BODY_SCALE_JOINT_NAMES),
+        "g_PCK_scale_source":          "ground_truth",
     }
 
     for thr in GRAPHPOSE_PCK_THRESHOLDS:
         tag = int(round(thr * 100))
-        metrics[f"g_PCK@{tag}"]                       = graphpose_pck_mmfi(pred, gt, thr)
-        metrics[f"constant_mean_pose_g_PCK@{tag}"]    = graphpose_pck_mmfi(const_pose, gt, thr)
+        metrics[f"g_PCK@{tag}"] = graphpose_pck_mmfi(pred, gt, thr)
 
     return metrics

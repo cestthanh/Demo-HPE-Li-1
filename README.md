@@ -51,8 +51,7 @@ hyperparameters, which used a different model width and 2D output.
 
 ```text
 config/mmfi/
-  config_p1s1.yaml            Default Protocol 1 Setting 1 experiment
-  config.yaml                 Generic Protocol 3 preset
+  config_phase_c_demo_2_p1s1.yaml  Fixed Protocol 1 Setting 1 experiment
 docs/
   model_logic_vi.md           Vietnamese architecture and ablation notes
 feeder/
@@ -78,10 +77,11 @@ Set the MMFi dataset root:
 $env:MMFI_DATASET_ROOT = "D:\path\to\mmfi\dataset"
 ```
 
-Run the default experiment:
+Run the canonical DSK-only experiment:
 
 ```powershell
-python train.py
+python train.py --device cuda --seed 0 `
+  --run-name phase_c_demo_2_p1s1_dsk_only_seed0
 ```
 
 Run a short smoke test:
@@ -90,13 +90,34 @@ Run a short smoke test:
 python train.py --epochs 1 --max-train-batches 1 --eval-max-batches 1
 ```
 
-Results are written to `results/dsk_only` by default.
+The fixed training profile is:
+
+- Loss: MSE on train-set XYZ z-scores.
+- Optimizer: Adam, learning rate `0.001`, weight decay `0`.
+- LR scheduler: none.
+- Gradient clipping: norm `1.0`.
+- Maximum epochs: `60`.
+- Early stopping: patience `15`, minimum improvement `0.2 mm`.
+- Best checkpoint: minimum validation MPJPE.
+- Test evaluation: run separately after training.
+
+Run the two ablation seeds:
+
+```powershell
+python train.py --device cuda --seed 0 `
+  --run-name phase_c_demo_2_p1s1_dsk_only_seed0
+python train.py --device cuda --seed 1 `
+  --run-name phase_c_demo_2_p1s1_dsk_only_seed1
+```
+
+Results are written to `results/phase_c` by default.
 
 ## Evaluation
 
 ```powershell
 python tools/evaluate.py `
-  --checkpoint results/dsk_only/<run>/checkpoints/best.pt `
+  --checkpoint results/phase_c/<run>/checkpoints/best.pt `
+  --dataset-root $env:MMFI_DATASET_ROOT `
   --eval-split test
 ```
 
@@ -105,7 +126,7 @@ python tools/evaluate.py `
 - MPJPE and PA-MPJPE in millimetres.
 - PCK@50mm and PCK@100mm.
 - Body-scale `g_PCK@10` through `g_PCK@50`.
-- Per-joint and collapse-diagnostic metrics.
+- Per-joint MPJPE.
 
 These definitions are copied from `HPE-Li-3D` to keep evaluation parity.
 

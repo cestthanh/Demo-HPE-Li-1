@@ -1,26 +1,21 @@
 """
 train.py
-Training entry point for DSKNetMMFI3D - the DSK-only 3D HPE ablation
-from WiFi-CSI signals on the MMFi dataset.
+Training entry point for the DSK-only 3D HPE ablation on the MMFi dataset.
 
 Typical usage
 -------------
-    # Default (random split, 20 epochs)
+    # P1-S1 canonical run: normalized MSE, Adam, up to 60 epochs
     python train.py
 
-    # Cross-subject split, 60 epochs on GPU
-    python train.py --split-to-use cross_subject_split --epochs 60 --device cuda
-
-    # Quick smoke test (2 epochs, 10 batches each)
-    python train.py --epochs 2 --max-train-batches 10 --eval-max-batches 5
+    # One-batch parity smoke test
+    python train.py --epochs 1 --max-train-batches 1 --eval-max-batches 1
 
 Environment variables
 ---------------------
     MMFI_DATASET_ROOT            Path to MMFi dataset root.
-    DSK_ONLY_OUTPUT              Output directory for runs.
-    DSK_ONLY_EPOCHS              Number of epochs.
-    DSK_ONLY_LR                  Learning rate.
-    DSK_ONLY_WEIGHT_DECAY        Optimizer weight decay.
+    PHASE_C_OUTPUT               Output directory for runs.
+    PHASE_C_EPOCHS               Number of epochs.
+    PHASE_C_LR                   Learning rate.
 """
 import argparse
 import copy
@@ -36,14 +31,23 @@ import torch
 import yaml
 from tqdm import tqdm
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from feeder import make_dataloader, make_dataset
 from feeder.splits import split_eval_dataset_by_sequence
 from model.dsknet3d import CHECKPOINT_FORMAT_VERSION, DSKNetMMFI3D
 from utils.eval_3d import compute_3d_metrics
+
+
+P1S1_CONFIG_PATH = (
+    PROJECT_ROOT / "config" / "mmfi" / "config_phase_c_demo_2_p1s1.yaml"
+)
+POSE_STD_EPS = 1e-6
+GRAD_CLIP_NORM = 1.0
+EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_MIN_DELTA_MM = 0.2
 
 
 # ─── SECTION 1: CLI & Setup ───────────────────────────────────────────────────
@@ -52,44 +56,23 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Train the DSK-only 3D HPE ablation on MMFi."
     )
-    # Data
-    p.add_argument("--config",
-                   default=str(PROJECT_ROOT / "config" / "mmfi" /
-                               "config_p1s1.yaml"),
-                   help="Path to the MMFi YAML config.")
     p.add_argument("--dataset-root",
                    default=os.getenv("MMFI_DATASET_ROOT",
                                      str(PROJECT_ROOT / "data" / "mmfi" / "dataset")),
                    help="MMFi dataset root directory.")
-    p.add_argument("--split-to-use", default=None,
-                   choices=["random_split", "cross_scene_split",
-                             "cross_subject_split", "manual_split"],
-                   help="Override config split_to_use without editing YAML.")
     # Output
     p.add_argument("--output-dir",
-                   default=os.getenv("DSK_ONLY_OUTPUT",
-                                     str(PROJECT_ROOT / "results" / "dsk_only")),
+                   default=os.getenv("PHASE_C_OUTPUT",
+                                     str(PROJECT_ROOT / "results" / "phase_c")),
                    help="Root directory for logs, metrics, and checkpoints.")
     p.add_argument("--run-name", default=None,
                    help="Optional run name (default: timestamp + split).")
     # Training
-    p.add_argument("--epochs",       type=int,   default=int(os.getenv("DSK_ONLY_EPOCHS", "20")))
-    p.add_argument("--lr",           type=float, default=float(os.getenv("DSK_ONLY_LR", "0.001")))
-    p.add_argument("--optimizer",    default="adam", choices=["adam", "adamw"])
-    p.add_argument("--weight-decay", type=float, default=float(os.getenv("DSK_ONLY_WEIGHT_DECAY", "0.0")))
+    p.add_argument("--epochs",       type=int,   default=int(os.getenv("PHASE_C_EPOCHS", "60")))
+    p.add_argument("--lr",           type=float, default=float(os.getenv("PHASE_C_LR", "0.001")))
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--device",       default="auto", choices=["auto", "cpu", "cuda"])
-    p.add_argument("--loss",         default="smooth_l1", choices=["smooth_l1", "mse"])
-    p.add_argument("--smooth-l1-beta", type=float, default=0.05)
-    p.add_argument("--grad-clip",      type=float, default=1.0)
     p.add_argument("--log-interval",   type=int,   default=100)
-    # Pose normalisation
-    p.add_argument("--normalize-pose", action="store_true",
-                   help="Z-score normalise pose targets during training.")
-    p.add_argument("--pose-std-eps", type=float, default=1e-6)
-    # Early stopping
-    p.add_argument("--early-stopping-patience",  type=int,   default=None)
-    p.add_argument("--early-stopping-min-delta", type=float, default=1.0)
     # Debug / batch limits
     p.add_argument("--eval-max-batches",  type=int, default=None)
     p.add_argument("--max-train-batches", type=int, default=None)
@@ -97,8 +80,6 @@ def parse_args():
     p.add_argument("--val-batch-size",    type=int, default=None)
     p.add_argument("--test-batch-size",   type=int, default=None)
     p.add_argument("--num-workers",       type=int, default=None)
-    p.add_argument("--no-test", action="store_true",
-                   help="Skip final test evaluation on best checkpoint.")
     return p.parse_args()
 
 
@@ -121,14 +102,27 @@ def set_seed(seed):
 # ─── SECTION 2: Data ──────────────────────────────────────────────────────────
 
 def load_config(path):
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.load(f, Loader=yaml.FullLoader)
+
+
+def validate_p1s1_config(config):
+    expected = {
+        "modality": "wifi-csi",
+        "protocol": "protocol1",
+        "data_unit": "frame",
+        "split_to_use": "random_split",
+    }
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ValueError(f"P1-S1 requires {key}={value!r}, got {config.get(key)!r}.")
+    random_split = config.get("random_split", {})
+    if random_split.get("ratio") != 0.8 or random_split.get("random_seed") != 0:
+        raise ValueError("P1-S1 requires random_split ratio=0.8 and random_seed=0.")
 
 
 def apply_loader_overrides(config, args):
     config = copy.deepcopy(config)
-    if args.split_to_use is not None:
-        config["split_to_use"] = args.split_to_use
     for key in ("train_loader", "val_loader", "test_loader"):
         config[key] = dict(config[key])
     if args.train_batch_size is not None:
@@ -218,14 +212,12 @@ def denormalize_pose(pose, stats):
 
 # ─── SECTION 4: Training & Evaluation ────────────────────────────────────────
 
-def make_criterion(args):
-    return (torch.nn.SmoothL1Loss(beta=args.smooth_l1_beta)
-            if args.loss == "smooth_l1" else torch.nn.MSELoss())
+def make_criterion():
+    return torch.nn.MSELoss()
 
 
-def make_optimizer(args, model):
-    cls = torch.optim.Adam if args.optimizer == "adam" else torch.optim.AdamW
-    return cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+def make_optimizer(model, learning_rate):
+    return torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 
 def _batch_to_device(batch, device):
@@ -246,8 +238,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, args, epoch, st
         loss = criterion(pred, normalize_pose(gt, stats))
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if args.grad_clip and args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
         v = float(loss.item())
         losses.append(v)
@@ -286,20 +277,48 @@ def evaluate(model, loader, criterion, device, stats=None, max_batches=None, des
 # ─── SECTION 5: Checkpointing & Logging ──────────────────────────────────────
 
 def _save_json(path, payload):
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
 
 def _make_training_metadata(args):
     return {
+        "profile":                      "phase_C_demo_2_p1s1",
         "architecture_variant":         "hpe_li_dsk_only_3d_ablation",
         "transformer_enabled":          False,
         "ablation_reference":           "HPE-Li-3D DSKNetTransMMFI3D",
-        "loss":                         args.loss,
-        "pose_target_space":            "normalized_xyz" if args.normalize_pose else "metric_xyz_meters",
+        "loss":                         "mse",
+        "pose_target_space":            "normalized_xyz",
+        "pose_std_eps":                 POSE_STD_EPS,
+        "optimizer":                    "adam",
+        "learning_rate":                args.lr,
+        "weight_decay":                 0.0,
+        "lr_scheduler":                 None,
+        "grad_clip_norm":               GRAD_CLIP_NORM,
+        "maximum_epochs":                args.epochs,
+        "early_stopping_patience":       EARLY_STOPPING_PATIENCE,
+        "early_stopping_min_delta_mm":   EARLY_STOPPING_MIN_DELTA_MM,
         "checkpoint_selection_metric":  "val_mpjpe_mm",
         "checkpoint_selection_mode":    "min",
+        "test_during_training":          False,
     }
+
+
+def _update_early_stopping_state(current_mpjpe, best_mpjpe, no_improve_count):
+    meaningful_improvement = (
+        current_mpjpe < best_mpjpe - EARLY_STOPPING_MIN_DELTA_MM
+    )
+    is_best = current_mpjpe < best_mpjpe
+    if is_best:
+        previous_best = best_mpjpe
+        best_mpjpe = current_mpjpe
+        if meaningful_improvement or previous_best == float("inf"):
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+    else:
+        no_improve_count += 1
+    return best_mpjpe, no_improve_count, is_best
 
 
 def save_checkpoint(path, model, optimizer, epoch, config, args, metrics):
@@ -328,14 +347,6 @@ def print_epoch_metrics(epoch, train_m, val_m):
         f"g_PCK@50={val_m['g_PCK@50']:.1f}% pa_invalid={val_m['pa_mpjpe_invalid_count']}",
         flush=True,
     )
-    print(
-        f"  [diag] axis_mae={val_m['axis_mae_mm_by_name']} "
-        f"root_mpjpe={val_m['root_mpjpe_mm']:.3f} "
-        f"rc_mpjpe={val_m['root_centered_mpjpe_mm']:.3f} "
-        f"const_mpjpe={val_m['constant_mean_pose_mpjpe_mm']:.3f} "
-        f"pa_gain={val_m['pa_mpjpe_gain_over_constant_mean_pose_mm']:.3f}",
-        flush=True,
-    )
 
 
 # ─── SECTION 6: Main ─────────────────────────────────────────────────────────
@@ -346,9 +357,11 @@ def main():
     device = resolve_device(args.device)
 
     # ── Config & run directory ────────────────────────────────────────────────
-    config  = apply_loader_overrides(load_config(args.config), args)
+    config = load_config(P1S1_CONFIG_PATH)
+    validate_p1s1_config(config)
+    config = apply_loader_overrides(config, args)
     run_dir = make_run_dir(args.output_dir, args.run_name, config["split_to_use"])
-    with open(run_dir / "config.yaml", "w") as f:
+    with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(config, f, sort_keys=False)
     _save_json(run_dir / "args.json", vars(args))
 
@@ -363,20 +376,19 @@ def main():
     print(f"samples: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}", flush=True)
     print(f"batches: train={len(train_loader)} val={len(val_loader)} test={len(test_loader)}", flush=True)
 
-    # ── Pose normalisation ────────────────────────────────────────────────────
-    pose_stats = {"enabled": False}
-    if args.normalize_pose:
-        pose_stats = compute_pose_normalization_stats(train_ds, eps=args.pose_std_eps)
-        print(f"pose_norm: mean={pose_stats['mean_xyz']} std={pose_stats['std_xyz']}", flush=True)
+    # Phase C demo 2 trains on train-set XYZ z-scores.
+    pose_stats = compute_pose_normalization_stats(train_ds, eps=POSE_STD_EPS)
+    print(f"pose_norm: mean={pose_stats['mean_xyz']} std={pose_stats['std_xyz']}", flush=True)
     _save_json(run_dir / "xyz_stats.json", pose_stats)
     stats_t = make_pose_stats_tensors(pose_stats, device)
 
     # ── Model, loss, optimizer ────────────────────────────────────────────────
     model     = DSKNetMMFI3D().to(device)
-    criterion = make_criterion(args).to(device)
-    optimizer = make_optimizer(args, model)
+    criterion = make_criterion().to(device)
+    optimizer = make_optimizer(model, args.lr)
     print(f"model_config={model.get_model_config()} "
-          f"optimizer={args.optimizer} lr={args.lr}", flush=True)
+          f"loss=mse pose_target=train_xyz_zscore optimizer=adam lr={args.lr}",
+          flush=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_mpjpe     = float("inf")
@@ -404,27 +416,26 @@ def main():
         save_checkpoint(last_ckpt, model, optimizer, epoch, config, args, ckpt_meta)
 
         cur_mpjpe = val_m["mpjpe_mm"]
-        if cur_mpjpe < best_val_mpjpe:
-            prev_best      = best_val_mpjpe
-            best_val_mpjpe = cur_mpjpe
+        best_val_mpjpe, no_improve_count, is_best = (
+            _update_early_stopping_state(
+                cur_mpjpe, best_val_mpjpe, no_improve_count
+            )
+        )
+        if is_best:
             best_epoch     = epoch
             save_checkpoint(best_ckpt, model, optimizer, epoch, config, args, ckpt_meta)
             print(f"[best] epoch={epoch} val_mpjpe={best_val_mpjpe:.3f}", flush=True)
-            if cur_mpjpe < prev_best - args.early_stopping_min_delta or prev_best == float("inf"):
-                no_improve_count = 0
-            else:
-                no_improve_count += 1
-        else:
-            no_improve_count += 1
 
-        if (args.early_stopping_patience and
-                no_improve_count >= args.early_stopping_patience):
-            print(f"[early stop] epoch={epoch} best_epoch={best_epoch} "
-                  f"best_val_mpjpe={best_val_mpjpe:.3f}", flush=True)
+        if no_improve_count >= EARLY_STOPPING_PATIENCE:
+            print(
+                f"[early stop] epoch={epoch} best_epoch={best_epoch} "
+                f"best_val_mpjpe={best_val_mpjpe:.3f}",
+                flush=True,
+            )
             stopped_early = True
             break
 
-    # ── Final test evaluation on best checkpoint ──────────────────────────────
+    # Test evaluation is intentionally separate, matching the canonical runs.
     final = {
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
         "model_name":         "DSKNetMMFI3D",
@@ -437,24 +448,6 @@ def main():
         "eval_split_metadata": split_meta,
         "history":            history,
     }
-
-    if not args.no_test:
-        try:
-            ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
-        except TypeError:
-            ckpt = torch.load(best_ckpt, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        test_m = evaluate(model, test_loader, criterion, device,
-                          stats=stats_t, max_batches=args.eval_max_batches,
-                          desc="test best")
-        final["test"] = test_m
-        print(
-            f"[test] loss={test_m['loss']:.6f} "
-            f"mpjpe={test_m['mpjpe_mm']:.3f} pa_mpjpe={test_m['pa_mpjpe_mm']:.3f} "
-            f"pck50mm={test_m['pck_50mm']:.2f}% "
-            f"g_PCK@50={test_m['g_PCK@50']:.1f}%",
-            flush=True,
-        )
 
     _save_json(run_dir / "final_metrics.json", final)
     print(f"[done] run_dir={run_dir}", flush=True)

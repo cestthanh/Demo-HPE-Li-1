@@ -1,5 +1,5 @@
-# DSK-only ablation: MMFi Protocol 1, Setting 1 (random split).
-# Values intentionally match the HPE-Li++ 3D reference configuration.
+# Phase C demo 2: MMFi Protocol 1, Setting 1 (random split).
+# The 0.8 ratio matches the phase_C_demo_2 reference configuration.
 modality: wifi-csi
 protocol: protocol1
 data_unit: frame
