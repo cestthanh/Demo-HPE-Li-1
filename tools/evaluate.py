@@ -34,6 +34,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from feeder import make_dataloader, make_dataset
 from feeder.splits import split_eval_dataset_by_sequence
 from model.dsknet3d import (
+    MODEL_NAME,
     DSKNetMMFI3D,
     get_model_config_from_checkpoint,
     normalize_state_dict,
@@ -73,7 +74,7 @@ def parse_args():
     p.add_argument("--output-json",          default=None)
     p.add_argument("--output-md",            default=None)
     p.add_argument("--output-graphpose-md",  default=None)
-    p.add_argument("--method-name",  default="DSKNetMMFI3D")
+    p.add_argument("--method-name",  default=MODEL_NAME)
     return p.parse_args()
 
 
@@ -158,6 +159,12 @@ def make_eval_loader(dataset_root, config, args, partition_unit):
 
 def load_model(checkpoint, device):
     if isinstance(checkpoint, dict):
+        checkpoint_model = checkpoint.get("model_name")
+        if checkpoint_model not in (None, MODEL_NAME):
+            raise ValueError(
+                f"Checkpoint model_name={checkpoint_model!r} is incompatible "
+                f"with {MODEL_NAME!r}."
+            )
         sd = checkpoint.get("model_state_dict")
         if not isinstance(sd, dict):
             raise ValueError("Checkpoint missing 'model_state_dict'.")
@@ -274,7 +281,7 @@ def main():
         "dataset_root":       args.dataset_root,
         "split_to_use":       config["split_to_use"],
         "eval_split":         args.eval_split,
-        "model_name":         "DSKNetMMFI3D",
+        "model_name":         MODEL_NAME,
         "model_config":       model.get_model_config(),
         "pose_normalization": pose_stats,
         "eval_split_metadata": split_meta,

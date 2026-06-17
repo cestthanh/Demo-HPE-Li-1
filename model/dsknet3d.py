@@ -1,10 +1,18 @@
-"""
-DSK-only 3D HPE model for a controlled HPE-Li vs HPE-Li++ ablation.
+"""DSKNet 3D without Transformer for MMFi Phase C.
 
-The architecture matches HPE-Li-3D in channel widths, selective-kernel
-branches, pooling, regression head, input shape, and output shape. The only
-model-level ablation is the removal of ChannelTransformer refinement.
+This file ports the DSKConv logic from
+``HPE-Li-ECCV2024/model/sknet_trans_mmfi.py`` to 3D pose output. The DSKConv
+part keeps the author's dual selective-kernel structure:
+
+1. stack multi-dilation convolution branches;
+2. select branches by channel attention;
+3. select branches by frequency attention;
+4. concatenate both selected features along width;
+5. batch-normalize and average-pool width back to the original size.
+
+The ChannelTransformer found in the forked source is intentionally removed.
 """
+
 import time
 
 import torch
@@ -13,6 +21,9 @@ from torch import nn
 
 from .utils import regression
 
+
+MODEL_NAME = "DSKNetMMFI3D"
+CHECKPOINT_FORMAT_VERSION = 2
 
 DEFAULT_CONFIG = {
     "num_lay": 128,
@@ -23,11 +34,9 @@ DEFAULT_CONFIG = {
     "sk_l": 32,
 }
 
-CHECKPOINT_FORMAT_VERSION = 1
-
 
 def _normalize_config(config=None):
-    """Merge model overrides into the ablation defaults and validate them."""
+    """Merge model overrides into DSKNet defaults and validate them."""
     cfg = dict(DEFAULT_CONFIG)
     if config:
         unknown = set(config) - set(cfg)
@@ -51,35 +60,26 @@ def _normalize_config(config=None):
 
 
 def get_model_config_from_checkpoint(checkpoint):
-    """Extract the DSK-only model configuration from a checkpoint."""
-    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("model_config"), dict):
+    """Extract the DSKNet model configuration from a checkpoint."""
+    if isinstance(checkpoint, dict) and isinstance(
+        checkpoint.get("model_config"), dict
+    ):
         return _normalize_config(checkpoint["model_config"])
     return _normalize_config()
 
 
 def normalize_state_dict(state_dict):
-    """Remove a DataParallel prefix without changing model parameter names."""
+    """Remove a DataParallel prefix without changing parameter names."""
     return {key.removeprefix("module."): value for key, value in state_dict.items()}
 
 
 class DSKConv(nn.Module):
-    """Dual selective-kernel convolution without Transformer refinement.
-
-    The block keeps the same HPE-Li++ feature paths:
-
-    1. Parallel dilated grouped-convolution branches.
-    2. Branch selection per feature channel.
-    3. Branch selection per frequency row.
-    4. Concatenation along the temporal width.
-    5. Batch normalization and width pooling.
-
-    Removing only the Transformer preserves the input/output shape of the
-    corresponding HPE-Li++ block.
-    """
+    """Dual selective-kernel convolution without ChannelTransformer."""
 
     def __init__(
         self,
         features,
+        img_size,
         m=3,
         groups=32,
         reduction=4,
@@ -89,9 +89,12 @@ class DSKConv(nn.Module):
         super().__init__()
         if features % groups != 0:
             raise ValueError(f"groups={groups} must divide features={features}.")
+        if len(img_size) != 2:
+            raise ValueError(f"img_size must be [height, width], got {img_size}.")
 
-        bottleneck = max(features // reduction, min_bottleneck)
+        bottleneck = max(int(features / reduction), min_bottleneck)
         self.features = int(features)
+        self.img_size = [int(img_size[0]), int(img_size[1])]
         self.m = int(m)
 
         self.convs = nn.ModuleList(
@@ -127,42 +130,49 @@ class DSKConv(nn.Module):
         self.norm = nn.BatchNorm2d(features)
 
     def forward(self, x):
-        # (B, M, C, F, T)
-        branch_features = torch.stack([conv(x) for conv in self.convs], dim=1)
+        # [B, M, C, H, W]
+        feats = torch.stack([conv(x) for conv in self.convs], dim=1)
 
-        # CwSKA: select a kernel branch independently for every feature channel.
-        merged = branch_features.sum(dim=1)
-        descriptor = self.fc(self.gap(merged))
-        channel_weights = self.softmax(
-            torch.stack([fc(descriptor) for fc in self.fcs], dim=1)
+        # CwSKA: branch selection per feature channel.
+        feats_u = feats.sum(dim=1)
+        feats_s = self.gap(feats_u)
+        feats_z = self.fc(feats_s)
+        channel_attention = torch.stack(
+            [fc(feats_z) for fc in self.fcs],
+            dim=1,
         )
-        channel_selected = (branch_features * channel_weights).sum(dim=1)
+        channel_attention = self.softmax(channel_attention)
+        feats_channel = (feats * channel_attention).sum(dim=1)
 
-        # FwSKA: select a kernel branch independently for every frequency row.
-        frequency_summary = branch_features.sum(dim=2)
-        frequency_weights = self.softmax(
-            F.adaptive_avg_pool2d(
-                frequency_summary,
-                (frequency_summary.size(2), 1),
+        # FwSKA: branch selection per frequency row.
+        feats_frequency = feats.sum(dim=2)
+        frequency_attention = F.adaptive_avg_pool2d(
+            feats_frequency,
+            (feats_frequency.size(2), 1),
+        )
+        frequency_attention = self.softmax(frequency_attention)
+        feats_frequency = (feats * frequency_attention.unsqueeze(2)).sum(dim=1)
+
+        fused = torch.cat([feats_channel, feats_frequency], dim=3)
+        if list(fused.shape[2:4]) != self.img_size:
+            raise RuntimeError(
+                f"DSKConv expected fused spatial size {self.img_size}, "
+                f"got {list(fused.shape[2:4])}."
             )
-        )
-        frequency_selected = (
-            branch_features * frequency_weights.unsqueeze(2)
-        ).sum(dim=1)
 
-        # Keep the HPE-Li++ fusion geometry, but omit ChannelTransformer.
-        fused = torch.cat([channel_selected, frequency_selected], dim=3)
-        return F.avg_pool2d(self.norm(fused), kernel_size=(1, 2))
+        fused = self.norm(fused)
+        return F.avg_pool2d(fused, kernel_size=(1, 2))
 
 
-class SKUnit(nn.Module):
-    """Project, downsample, apply DSKConv, and project to output channels."""
+class DSKUnit(nn.Module):
+    """Projection, spatial pooling, DSKConv, normalization, and projection."""
 
     def __init__(
         self,
         in_features,
         mid_features,
         out_features,
+        img_size,
         m=3,
         groups=32,
         reduction=4,
@@ -171,13 +181,14 @@ class SKUnit(nn.Module):
     ):
         super().__init__()
         self.conv1 = nn.Sequential(
-            nn.Conv2d(in_features, mid_features, kernel_size=1, bias=False),
+            nn.Conv2d(in_features, mid_features, kernel_size=1, stride=1, bias=False),
             nn.BatchNorm2d(mid_features),
             nn.ReLU(inplace=True),
         )
-        self.pool = nn.AvgPool2d((2, 2))
+        self.pooling = nn.AvgPool2d((2, 2))
         self.dsk = DSKConv(
             mid_features,
+            img_size=img_size,
             m=m,
             groups=groups,
             reduction=reduction,
@@ -186,18 +197,20 @@ class SKUnit(nn.Module):
         )
         self.norm = nn.BatchNorm2d(mid_features)
         self.conv3 = nn.Sequential(
-            nn.Conv2d(mid_features, out_features, kernel_size=1, bias=False),
+            nn.Conv2d(mid_features, out_features, kernel_size=1, stride=1, bias=False),
             nn.BatchNorm2d(out_features),
         )
 
     def forward(self, x):
-        x = self.pool(self.conv1(x))
+        x = self.conv1(x)
+        x = self.pooling(x)
         x = self.dsk(x)
-        return self.conv3(self.norm(x))
+        x = self.norm(x)
+        return self.conv3(x)
 
 
 class DSKNetMMFI3D(nn.Module):
-    """DSK-only 3D pose estimator used as the HPE-Li++ Transformer ablation."""
+    """3D DSKNet pose estimator without ChannelTransformer."""
 
     def __init__(self, **model_config):
         super().__init__()
@@ -212,29 +225,41 @@ class DSKNetMMFI3D(nn.Module):
             "stride": 1,
         }
 
-        self.skunit1 = SKUnit(3, channels, channels, **dsk_kwargs)
+        self.dskunit1 = DSKUnit(
+            3,
+            channels,
+            channels,
+            img_size=[57, 10],
+            **dsk_kwargs,
+        )
         self.bn = nn.BatchNorm2d(channels)
-        self.skunit2 = SKUnit(
+        self.dskunit2 = DSKUnit(
             channels,
             channels * 2,
             channels * 2,
+            img_size=[28, 4],
             **dsk_kwargs,
         )
         self.final_pool = nn.AvgPool2d((2, 2))
         self.regression = regression(
             input_dim=3584,
-            output_dim=51,
+            output_dim=17 * 3,
             hidden_dim=hidden_reg,
         )
 
     def _extract_features(self, x):
-        x = self.skunit1(x)
+        x = self.dskunit1(x)
         x = self.bn(x)
-        x = self.skunit2(x)
+        x = self.dskunit2(x)
         return self.final_pool(x)
 
     def forward(self, x):
         """Map CSI ``(B, 3, 114, 10)`` to pose ``(B, 17, 3)``."""
+        if tuple(x.shape[1:]) != (3, 114, 10):
+            raise ValueError(
+                "DSKNetMMFI3D expects input shape (B, 3, 114, 10), "
+                f"got {tuple(x.shape)}."
+            )
         start = time.time()
         features = self._extract_features(x)
         pose = self.regression(features).reshape(x.size(0), 17, 3)

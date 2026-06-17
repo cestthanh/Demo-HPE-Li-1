@@ -1,6 +1,6 @@
 """
 train.py
-Training entry point for the DSK-only 3D HPE ablation on the MMFi dataset.
+Training entry point for the DSKNet 3D no-Transformer baseline on MMFi.
 
 Typical usage
 -------------
@@ -37,7 +37,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from feeder import make_dataloader, make_dataset
 from feeder.splits import split_eval_dataset_by_sequence
-from model.dsknet3d import CHECKPOINT_FORMAT_VERSION, DSKNetMMFI3D
+from model.dsknet3d import (
+    CHECKPOINT_FORMAT_VERSION,
+    MODEL_NAME,
+    DSKNetMMFI3D,
+)
 from utils.eval_3d import compute_3d_metrics
 
 
@@ -54,7 +58,7 @@ EARLY_STOPPING_MIN_DELTA_MM = 0.2
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Train the DSK-only 3D HPE ablation on MMFi."
+        description="Train the DSKNet 3D no-Transformer baseline on MMFi."
     )
     p.add_argument("--dataset-root",
                    default=os.getenv("MMFI_DATASET_ROOT",
@@ -284,9 +288,13 @@ def _save_json(path, payload):
 def _make_training_metadata(args):
     return {
         "profile":                      "phase_C_demo_2_p1s1",
-        "architecture_variant":         "hpe_li_dsk_only_3d_ablation",
+        "architecture_variant":         "dsknet_3d_no_transformer",
+        "architecture_source":          "HPE-Li DSKNet / sknet_trans_mmfi.py",
+        "source_module":                "model/sknet_trans_mmfi.py",
+        "source_output":                "17x2",
+        "adapted_output":               "17x3",
         "transformer_enabled":          False,
-        "ablation_reference":           "HPE-Li-3D DSKNetTransMMFI3D",
+        "transformer_removed_from_dskconv": True,
         "loss":                         "mse",
         "pose_target_space":            "normalized_xyz",
         "pose_std_eps":                 POSE_STD_EPS,
@@ -324,7 +332,7 @@ def _update_early_stopping_state(current_mpjpe, best_mpjpe, no_improve_count):
 def save_checkpoint(path, model, optimizer, epoch, config, args, metrics):
     torch.save({
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
-        "model_name":         "DSKNetMMFI3D",
+        "model_name":         MODEL_NAME,
         "model_config":       model.get_model_config(),
         "model_state_dict":   model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
@@ -438,7 +446,7 @@ def main():
     # Test evaluation is intentionally separate, matching the canonical runs.
     final = {
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
-        "model_name":         "DSKNetMMFI3D",
+        "model_name":         MODEL_NAME,
         "best_epoch":         best_epoch,
         "best_val_mpjpe_mm":  best_val_mpjpe,
         "stopped_early":      stopped_early,

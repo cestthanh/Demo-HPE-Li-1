@@ -1,5 +1,5 @@
-# Phase C demo 2: MMFi Protocol 1, Setting 1 (random split).
-# The 0.8 ratio matches the phase_C_demo_2 reference configuration.
+# DSKNet 3D no-Transformer baseline using the Phase C demo 2 profile.
+# Architecture settings live in model/dsknet3d.py.
 modality: wifi-csi
 protocol: protocol1
 data_unit: frame

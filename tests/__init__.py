@@ -1,1 +1,1 @@
-"""Tests for the DSK-only HPE-Li 3D ablation."""
+"""Tests for the DSKNet 3D no-Transformer baseline."""

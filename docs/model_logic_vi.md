@@ -1,250 +1,205 @@
-# Logic model HPE-Li DSK-only 3D
+# Logic model DSKNet 3D không Transformer
 
-## 1. Mục tiêu
+## 1. Lỗi đã gặp
 
-Repository này là thí nghiệm ablation để trả lời:
+Trước đó tôi đã chọn nhầm nguồn triển khai.
 
-> Khi giữ nguyên backbone, dữ liệu, cấu hình huấn luyện và regression head,
-> việc bỏ Channel Transformer ảnh hưởng thế nào đến kết quả pose 3D?
-
-Đây không phải bản sao tuyệt đối của cấu hình HPE-Li ECCV 2024. Model sử dụng
-logic DSKConv không Transformer của HPE-Li, nhưng giữ kích thước backbone của
-HPE-Li++ để so sánh công bằng.
-
-## 2. Cặp mô hình so sánh
+Tôi bám theo `SK_network.py` cũ, nơi dùng một kiểu SKConv lịch sử:
 
 ```text
-HPE-Li-3D / HPE-Li++
-  DSKConv++ + ChannelTransformer
-
-Demo HPE-Li 1
-  DSKConv, không ChannelTransformer
+cat -> view -> một attention freq-chan -> một output
 ```
 
-Các thành phần khác phải giống nhau:
+Nhưng yêu cầu đúng là DSKConv trong `model/sknet_trans_mmfi.py`, dù class trong
+file đó được đặt tên là `SKConv`. Forward đúng có:
 
-| Thành phần | Giá trị |
-|---|---:|
-| Input | `(B, 3, 114, 10)` |
-| Output | `(B, 17, 3)` |
-| Base channel | `128` |
-| Stage 2 channel | `256` |
-| Số DSK branch | `3` |
-| Convolution groups | `32` |
-| Reduction ratio | `4` |
-| Regression input | `3584` |
-| Regression output | `51` |
+```text
+torch.stack
+channel attention
+frequency attention
+concat hai output
+BatchNorm
+AvgPool2d(1, 2)
+```
 
-## 3. Luồng tổng thể
+Phần `ChannelTransformer` trong file fork được loại bỏ cho baseline này.
+
+## 2. Kiến trúc tổng thể
 
 ```text
 CSI (B, 3, 114, 10)
-  ->
-SKUnit 1
-  ->
-BatchNorm
-  ->
-SKUnit 2
-  ->
-AveragePool 2x2
-  ->
-RegressionHead
-  ->
-Pose (B, 17, 3)
+  -> DSKUnit 1
+       Conv1x1: 3 -> 128
+       AvgPool2d(2,2)
+       DSKConv no Transformer
+       BatchNorm
+       Conv1x1: 128 -> 128
+  -> (B, 128, 57, 5)
+  -> BatchNorm
+  -> DSKUnit 2
+       Conv1x1: 128 -> 256
+       AvgPool2d(2,2)
+       DSKConv no Transformer
+       BatchNorm
+       Conv1x1: 256 -> 256
+  -> (B, 256, 28, 2)
+  -> AvgPool2d(2,2)
+  -> (B, 256, 14, 1)
+  -> Flatten 3584
+  -> Regression 3584 -> 32 -> 64 -> 51
+  -> Pose (B, 17, 3)
 ```
 
-Shape:
+## 3. Config model
 
-| Giai đoạn | Shape |
+```python
+{
+    "num_lay": 128,
+    "hidden_reg": 32,
+    "sk_m": 3,
+    "sk_g": 32,
+    "sk_r": 4,
+    "sk_l": 32,
+}
+```
+
+Ý nghĩa:
+
+| Thành phần | Giá trị |
 |---|---:|
-| Input | `(B, 3, 114, 10)` |
-| SKUnit 1 | `(B, 128, 57, 5)` |
-| SKUnit 2 | `(B, 256, 28, 2)` |
-| Final pool | `(B, 256, 14, 1)` |
-| Flatten | `(B, 3584)` |
-| Regression | `(B, 51)` |
-| Output | `(B, 17, 3)` |
+| Base channel | `128` |
+| Stage 2 channel | `256` |
+| Số nhánh DSKConv | `3` |
+| Conv groups | `32` |
+| Reduction ratio | `4` |
+| Bottleneck min | `32` |
+| Transformer | Không |
 
-## 4. SKUnit
-
-Mỗi `SKUnit` thực hiện:
-
-```text
-Conv 1x1
-  ->
-BatchNorm + ReLU
-  ->
-AveragePool 2x2
-  ->
-DSKConv
-  ->
-BatchNorm
-  ->
-Conv 1x1 + BatchNorm
-```
-
-Hai model ablation và HPE-Li++ dùng cùng cấu trúc `SKUnit`.
-
-## 5. DSKConv
+## 4. DSKConv
 
 Đầu vào:
 
 ```text
-x: (B, C, F, T)
+x: (B, C, H, W)
 ```
 
-Ba grouped convolution chạy song song với dilation `1`, `2`, `3`:
+Ba nhánh convolution song song:
 
 ```text
-U_k1, U_k2, U_k3: (B, C, F, T)
+branch 1: dilation=1, padding=1
+branch 2: dilation=2, padding=2
+branch 3: dilation=3, padding=3
 ```
 
-Sau khi stack:
+Mỗi nhánh:
 
 ```text
-U: (B, M, C, F, T)
+Conv2d groups=32
+BatchNorm2d
+ReLU
 ```
 
-với `M = 3`.
+Sau đó stack:
 
-### 5.1. Channel-wise selective kernel attention
+```python
+feats = torch.stack([conv(x) for conv in self.convs], dim=1)
+```
 
-CwSKA trả lời:
-
-> Với từng feature channel, kernel branch nào nên được ưu tiên?
+Shape:
 
 ```text
-U
-  -> sum theo branch
-  -> global average pool trên F và T
-  -> bottleneck FC
-  -> sinh M bộ trọng số channel
+feats: (B, M, C, H, W)
+```
+
+## 5. Channel-wise selective kernel attention
+
+Mục tiêu: với từng feature channel, chọn nhánh dilation phù hợp.
+
+```text
+feats
+  -> sum theo M
+  -> global average pool trên H,W
+  -> Conv2d bottleneck
+  -> M Conv2d sinh weight
   -> softmax theo M
-  -> weighted sum các branch
+  -> weighted sum theo M
 ```
 
-Kết quả:
+Output:
 
 ```text
-V_channel: (B, C, F, T)
+feats_channel: (B, C, H, W)
 ```
 
-### 5.2. Frequency-wise selective kernel attention
+## 6. Frequency-wise selective kernel attention
 
-FwSKA trả lời:
-
-> Với từng hàng subcarrier, kernel branch nào nên được ưu tiên?
+Mục tiêu: với từng hàng frequency/subcarrier, chọn nhánh dilation phù hợp.
 
 ```text
-U
-  -> sum theo channel C
-  -> average theo time T
+feats
+  -> sum theo C
+  -> average pool theo W, giữ H
   -> softmax theo M
-  -> weighted sum các branch
+  -> weighted sum theo M
 ```
 
-Kết quả:
+Output:
 
 ```text
-V_frequency: (B, C, F, T)
+feats_frequency: (B, C, H, W)
 ```
 
-### 5.3. Fusion không Transformer
+## 7. Fusion không Transformer
 
-Hai feature được concat theo chiều thời gian:
+Source fork có:
 
 ```text
-(B, C, F, T) + (B, C, F, T)
-  ->
-(B, C, F, 2T)
+concat -> BatchNorm -> ChannelTransformer -> AvgPool2d(1,2)
 ```
 
-Sau đó:
+Repo này dùng:
 
 ```text
-BatchNorm
-  ->
-AveragePool kernel (1, 2)
-  ->
-(B, C, F, T)
+concat -> BatchNorm -> AvgPool2d(1,2)
 ```
 
-Đây là điểm ablation:
+Shape:
 
 ```text
-HPE-Li++:
-  concat -> BatchNorm -> ChannelTransformer -> AveragePool
-
-DSK-only:
-  concat -> BatchNorm -> AveragePool
+(B, C, H, W) + (B, C, H, W)
+  -> concat theo W
+(B, C, H, 2W)
+  -> AvgPool2d(1,2)
+(B, C, H, W)
 ```
 
-Không thay phép concat bằng phép cộng vì việc đó sẽ thay đổi thêm một yếu tố
-ngoài Transformer.
+Đây là khác biệt duy nhất trong DSKConv so với đoạn code bạn đưa: bỏ `self.tf`.
 
-### 5.4. Kiểm chứng số tham số
+## 8. Training profile
 
-Với cấu hình mặc định:
+Training vẫn theo Phase C Demo 2:
+
+- P1-S1;
+- random split ratio `0.8`, seed `0`;
+- val/test split theo sequence với seed `41`;
+- normalized MSE theo train XYZ mean/std;
+- Adam, learning rate `0.001`, weight decay `0`;
+- không scheduler;
+- gradient clipping `1.0`;
+- tối đa `60` epoch;
+- early stopping patience `15`, min delta `0.2 mm`;
+- best checkpoint theo validation MPJPE.
+
+## 9. Kết luận
+
+Bản đúng hiện tại không phải SKConv lịch sử `64/128`.
+
+Bản đúng hiện tại là:
 
 ```text
-HPE-Li++:  2,056,851 parameters
-DSK-only:    393,363 parameters
-Chênh lệch: 1,663,488 parameters
+DSKNet 3D no Transformer
+  -> DSKConv dual CwSKA/FwSKA
+  -> base channel 128
+  -> grouped conv G=32
+  -> output (B, 17, 3)
 ```
-
-HPE-Li++ có đúng `1,663,488` tham số nằm trong các module Transformer. Vì vậy
-chênh lệch tổng tham số bằng chính xác số tham số Transformer bị loại bỏ.
-
-Ngoài các key chứa `.transformer.`, 120 state-dict key còn lại của hai model
-trùng nhau. Đây là kiểm chứng trực tiếp rằng convolution branch, CwSKA, FwSKA,
-BatchNorm, SKUnit và regression head vẫn giữ cùng cấu trúc tham số.
-
-## 6. Regression head
-
-Feature cuối:
-
-```text
-(B, 256, 14, 1)
-```
-
-được flatten và đưa qua:
-
-```text
-3584 -> 32 -> 64 -> 51
-```
-
-Sau đó reshape:
-
-```text
-(B, 51) -> (B, 17, 3)
-```
-
-## 7. Điều kiện để kết quả ablation hợp lệ
-
-Hai lần train HPE-Li++ và DSK-only cần dùng cùng:
-
-- dataset root;
-- config split;
-- random seed;
-- batch size;
-- số epoch;
-- optimizer và learning rate;
-- loss;
-- pose normalization;
-- early stopping;
-- giới hạn batch;
-- metric implementation.
-
-Nên chạy nhiều seed và báo cáo trung bình cùng độ lệch chuẩn. Một lần chạy
-đơn lẻ chưa đủ để kết luận mọi chênh lệch đến từ Transformer.
-
-## 8. Kiểm tra trong code
-
-Test `test_model_contains_no_transformer_modules_or_parameters` bảo đảm:
-
-- không có module mang tên Transformer;
-- state dict không có key Transformer;
-- model vẫn tạo output `(B, 17, 3)`;
-- feature trước regression vẫn là `(B, 256, 14, 1)`.
-
-Vì vậy khác biệt kiến trúc có chủ đích chỉ nằm ở bước Transformer refinement.
