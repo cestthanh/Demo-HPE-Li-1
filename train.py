@@ -4,7 +4,7 @@ Training entry point for the DSKNet 3D no-Transformer baseline on MMFi.
 
 Typical usage
 -------------
-    # P1-S1 canonical run: normalized MSE, Adam, up to 60 epochs
+    # P1-S1 canonical run: normalized MSE, Adam, fixed 50 epochs
     python train.py
 
     # One-batch parity smoke test
@@ -50,8 +50,6 @@ P1S1_CONFIG_PATH = (
 )
 POSE_STD_EPS = 1e-6
 GRAD_CLIP_NORM = 1.0
-EARLY_STOPPING_PATIENCE = 15
-EARLY_STOPPING_MIN_DELTA_MM = 0.2
 
 
 # ─── SECTION 1: CLI & Setup ───────────────────────────────────────────────────
@@ -72,7 +70,7 @@ def parse_args():
     p.add_argument("--run-name", default=None,
                    help="Optional run name (default: timestamp + split).")
     # Training
-    p.add_argument("--epochs",       type=int,   default=int(os.getenv("PHASE_C_EPOCHS", "60")))
+    p.add_argument("--epochs",       type=int,   default=int(os.getenv("PHASE_C_EPOCHS", "50")))
     p.add_argument("--lr",           type=float, default=float(os.getenv("PHASE_C_LR", "0.001")))
     p.add_argument("--seed",         type=int,   default=0)
     p.add_argument("--device",       default="auto", choices=["auto", "cpu", "cuda"])
@@ -303,30 +301,14 @@ def _make_training_metadata(args):
         "weight_decay":                 0.0,
         "lr_scheduler":                 None,
         "grad_clip_norm":               GRAD_CLIP_NORM,
+        "training_strategy":            "fixed_epochs",
         "maximum_epochs":                args.epochs,
-        "early_stopping_patience":       EARLY_STOPPING_PATIENCE,
-        "early_stopping_min_delta_mm":   EARLY_STOPPING_MIN_DELTA_MM,
+        "early_stopping":               False,
         "checkpoint_selection_metric":  "val_mpjpe_mm",
         "checkpoint_selection_mode":    "min",
         "test_during_training":          False,
+        "final_test_checkpoint":         "best_validation_checkpoint",
     }
-
-
-def _update_early_stopping_state(current_mpjpe, best_mpjpe, no_improve_count):
-    meaningful_improvement = (
-        current_mpjpe < best_mpjpe - EARLY_STOPPING_MIN_DELTA_MM
-    )
-    is_best = current_mpjpe < best_mpjpe
-    if is_best:
-        previous_best = best_mpjpe
-        best_mpjpe = current_mpjpe
-        if meaningful_improvement or previous_best == float("inf"):
-            no_improve_count = 0
-        else:
-            no_improve_count += 1
-    else:
-        no_improve_count += 1
-    return best_mpjpe, no_improve_count, is_best
 
 
 def save_checkpoint(path, model, optimizer, epoch, config, args, metrics):
@@ -395,14 +377,14 @@ def main():
     criterion = make_criterion().to(device)
     optimizer = make_optimizer(model, args.lr)
     print(f"model_config={model.get_model_config()} "
-          f"loss=mse pose_target=train_xyz_zscore optimizer=adam lr={args.lr}",
+          f"loss=mse pose_target=train_xyz_zscore optimizer=adam lr={args.lr} "
+          f"training_strategy=fixed_epochs epochs={args.epochs}",
           flush=True)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     best_val_mpjpe     = float("inf")
     best_epoch         = None
-    no_improve_count   = 0
-    stopped_early      = False
+    best_state_dict    = None
     history            = []
     best_ckpt  = run_dir / "checkpoints" / "best.pt"
     last_ckpt  = run_dir / "checkpoints" / "last.pt"
@@ -424,40 +406,48 @@ def main():
         save_checkpoint(last_ckpt, model, optimizer, epoch, config, args, ckpt_meta)
 
         cur_mpjpe = val_m["mpjpe_mm"]
-        best_val_mpjpe, no_improve_count, is_best = (
-            _update_early_stopping_state(
-                cur_mpjpe, best_val_mpjpe, no_improve_count
-            )
-        )
-        if is_best:
+        if cur_mpjpe < best_val_mpjpe:
+            best_val_mpjpe = cur_mpjpe
             best_epoch     = epoch
+            best_state_dict = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
             save_checkpoint(best_ckpt, model, optimizer, epoch, config, args, ckpt_meta)
             print(f"[best] epoch={epoch} val_mpjpe={best_val_mpjpe:.3f}", flush=True)
 
-        if no_improve_count >= EARLY_STOPPING_PATIENCE:
-            print(
-                f"[early stop] epoch={epoch} best_epoch={best_epoch} "
-                f"best_val_mpjpe={best_val_mpjpe:.3f}",
-                flush=True,
-            )
-            stopped_early = True
-            break
+    if best_state_dict is None:
+        raise RuntimeError("Training finished without a best checkpoint.")
 
-    # Test evaluation is intentionally separate, matching the canonical runs.
+    # Final test uses the checkpoint selected by validation MPJPE.
+    model.load_state_dict(best_state_dict)
+    model.to(device)
+    test_m = evaluate(model, test_loader, criterion, device,
+                      stats=stats_t, max_batches=args.eval_max_batches,
+                      desc="test best-val checkpoint")
+
     final = {
         "checkpoint_format_version": CHECKPOINT_FORMAT_VERSION,
         "model_name":         MODEL_NAME,
         "best_epoch":         best_epoch,
         "best_val_mpjpe_mm":  best_val_mpjpe,
-        "stopped_early":      stopped_early,
+        "test_mpjpe_mm":      test_m["mpjpe_mm"],
+        "stopped_early":      False,
         "model_config":       model.get_model_config(),
         "pose_normalization": pose_stats,
         "training_metadata":  _make_training_metadata(args),
         "eval_split_metadata": split_meta,
         "history":            history,
+        "test":               test_m,
     }
 
     _save_json(run_dir / "final_metrics.json", final)
+    print(
+        f"[test] checkpoint=best epoch={best_epoch} "
+        f"test_mpjpe={test_m['mpjpe_mm']:.3f} "
+        f"test_pa_mpjpe={test_m['pa_mpjpe_mm']:.3f}",
+        flush=True,
+    )
     print(f"[done] run_dir={run_dir}", flush=True)
 
 

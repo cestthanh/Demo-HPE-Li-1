@@ -109,9 +109,10 @@ No `ChannelTransformer` is created or called in this repo.
 - Optimizer: Adam, learning rate `0.001`, weight decay `0`
 - Scheduler: none
 - Gradient clipping: `1.0`
-- Maximum epochs: `60`
-- Early stopping: patience `15`, minimum delta `0.2 mm`
+- Training schedule: fixed `50` epochs
+- Early stopping: disabled
 - Best checkpoint: minimum validation MPJPE
+- Final test: evaluated from the best validation checkpoint
 
 ## Training
 
@@ -119,9 +120,11 @@ No `ChannelTransformer` is created or called in this repo.
 $env:MMFI_DATASET_ROOT = "D:\path\to\mmfi\dataset"
 
 python train.py --device cuda --seed 0 `
+  --epochs 50 `
   --run-name dsknet_3d_no_transformer_p1s1_seed0
 
 python train.py --device cuda --seed 1 `
+  --epochs 50 `
   --run-name dsknet_3d_no_transformer_p1s1_seed1
 ```
 

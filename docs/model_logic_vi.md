@@ -186,9 +186,10 @@ Training vẫn theo Phase C Demo 2:
 - Adam, learning rate `0.001`, weight decay `0`;
 - không scheduler;
 - gradient clipping `1.0`;
-- tối đa `60` epoch;
-- early stopping patience `15`, min delta `0.2 mm`;
-- best checkpoint theo validation MPJPE.
+- train cố định `50` epoch;
+- không dùng early stopping;
+- best checkpoint theo validation MPJPE;
+- đánh giá test cuối bằng best checkpoint.
 
 ## 9. Kết luận
 

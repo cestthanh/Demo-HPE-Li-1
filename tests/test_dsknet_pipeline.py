@@ -16,12 +16,9 @@ from feeder.splits import split_eval_dataset_by_sequence  # noqa: E402
 from model import DEFAULT_CONFIG, MODEL_NAME, DSKConv, DSKNetMMFI3D  # noqa: E402
 from tools.evaluate import load_model  # noqa: E402
 from train import (  # noqa: E402
-    EARLY_STOPPING_MIN_DELTA_MM,
-    EARLY_STOPPING_PATIENCE,
     GRAD_CLIP_NORM,
     POSE_STD_EPS,
     _make_training_metadata,
-    _update_early_stopping_state,
     denormalize_pose,
     make_criterion,
     make_optimizer,
@@ -211,20 +208,18 @@ class MetricTests(unittest.TestCase):
 
 
 class TrainingProfileTests(unittest.TestCase):
-    def test_profile_keeps_phase_c_normalized_mse_and_adam(self):
+    def test_profile_keeps_fixed_epoch_normalized_mse_and_adam(self):
         criterion = make_criterion()
         optimizer_model = torch.nn.Linear(2, 1)
         optimizer = make_optimizer(optimizer_model, learning_rate=0.001)
         metadata = _make_training_metadata(
-            SimpleNamespace(lr=0.001, epochs=60)
+            SimpleNamespace(lr=0.001, epochs=50)
         )
 
         self.assertIsInstance(criterion, torch.nn.MSELoss)
         self.assertIsInstance(optimizer, torch.optim.Adam)
         self.assertEqual(POSE_STD_EPS, 1e-6)
         self.assertEqual(GRAD_CLIP_NORM, 1.0)
-        self.assertEqual(EARLY_STOPPING_PATIENCE, 15)
-        self.assertEqual(EARLY_STOPPING_MIN_DELTA_MM, 0.2)
         self.assertEqual(metadata["architecture_variant"], "dsknet_3d_no_transformer")
         self.assertEqual(metadata["source_module"], "model/sknet_trans_mmfi.py")
         self.assertEqual(metadata["source_output"], "17x2")
@@ -235,28 +230,17 @@ class TrainingProfileTests(unittest.TestCase):
         self.assertEqual(metadata["pose_target_space"], "normalized_xyz")
         self.assertEqual(metadata["weight_decay"], 0.0)
         self.assertIsNone(metadata["lr_scheduler"])
-        self.assertEqual(metadata["maximum_epochs"], 60)
-        self.assertEqual(metadata["early_stopping_patience"], 15)
-        self.assertEqual(metadata["early_stopping_min_delta_mm"], 0.2)
+        self.assertEqual(metadata["training_strategy"], "fixed_epochs")
+        self.assertEqual(metadata["maximum_epochs"], 50)
+        self.assertFalse(metadata["early_stopping"])
         self.assertEqual(metadata["checkpoint_selection_metric"], "val_mpjpe_mm")
         self.assertEqual(metadata["checkpoint_selection_mode"], "min")
         self.assertFalse(metadata["test_during_training"])
-        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.0)
-
-    def test_early_stopping_matches_reference_min_delta_semantics(self):
-        best, count, is_best = _update_early_stopping_state(
-            170.0, float("inf"), 0
+        self.assertEqual(
+            metadata["final_test_checkpoint"],
+            "best_validation_checkpoint",
         )
-        self.assertEqual((best, count, is_best), (170.0, 0, True))
-
-        best, count, is_best = _update_early_stopping_state(169.9, best, count)
-        self.assertEqual((best, count, is_best), (169.9, 1, True))
-
-        best, count, is_best = _update_early_stopping_state(170.1, best, count)
-        self.assertEqual((best, count, is_best), (169.9, 2, False))
-
-        best, count, is_best = _update_early_stopping_state(169.6, best, count)
-        self.assertEqual((best, count, is_best), (169.6, 0, True))
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.0)
 
     def test_pose_is_zscore_normalized_and_reconstructed(self):
         pose = torch.tensor([[[1.5, 4.0, 7.0]]])
